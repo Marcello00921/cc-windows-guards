@@ -5,7 +5,8 @@ Why: anthropics/claude-code#97660. On Windows an agent went from PowerShell to b
 variable; `rm -rf "$VAR/"` became `rm -rf /` and wiped the drive. Every Bash/PowerShell call is a NEW
 shell, so a variable set in a previous call does not exist in the next one.
 
-What it detects (Bash and PowerShell, also inside `bash -c`, `cmd /c`, `powershell -Command`/`-EncodedCommand`):
+What it detects (Bash and PowerShell, also inside `bash -c` / `bash -lc` / `& "...\bash.exe" -lc`, `wsl ...`,
+`cmd /c`, `powershell -Command`/`-EncodedCommand`, and `[System.IO.Directory]::Delete(path, $true)`):
   rm -r/-rf/-fr or rm with a glob · Remove-Item (and the PowerShell aliases rm/del/rd/ri/rmdir) with
   -Recurse or a glob · `gci -Recurse | Remove-Item` · rd/rmdir /s and del /s (cmd) · find -delete and
   find -exec rm · git clean -f · shutil.rmtree in `python -c`.
@@ -63,7 +64,12 @@ TIME_BUDGET_S = 2.5          # the hook timeout is 10 s and a cold Python start 
 COUNT_CEILING = 20000
 CONFIRM = re.compile(r"\bBLAST_OK=1\b")
 PREFILTER = re.compile(r"\brm\b|remove-item|\bri\b|\brd\b|\brmdir\b|\bdel\b|\berase\b|-delete\b|-exec(?:dir)?\b"
-                       r"|\bclean\b|rmtree|-encodedcommand\b|\s-enc?\s", re.I)
+                       r"|\bclean\b|rmtree|-encodedcommand\b|\s-enc?\s|::delete\b", re.I)
+# .NET from PowerShell: `[System.IO.Directory]::Delete(path, $true)` is a recursive delete with no cmdlet name
+RX_NET_DELETE = re.compile(r"\[\s*(?:System\.)?IO\.Directory\s*\]::Delete\s*\(\s*(.*?)\s*,\s*\$true\s*\)", re.I)
+# `bash -c`, but also the bundled short options agents type from PowerShell: `-lc`, `-ec`, `-xc`
+RX_SHELL_C = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
+SHELLS = ("bash", "sh", "zsh", "dash", "ksh")
 PUNCT = ";&|()\n"
 KEYWORDS = {"{", "}", "!", "then", "do", "else", "elif", "if", "while", "until", "done", "fi", "time", "[[", "]]"}
 RX_REDIR = re.compile(r"^(?:\d+|&|\*)?(?:>>?|<<?<?|>\|)(.*)$")
@@ -181,7 +187,7 @@ def _abs(p: str, ctx: Ctx) -> str:
     if s == "~" or s.startswith("~/"):
         s = _home(ctx.env) + s[1:]
     if ctx.dialect == "bash" and WINDOWS:
-        m = re.match(r"^/([A-Za-z])(/.*)?$", s)
+        m = re.match(r"^(?:/mnt)?/([A-Za-z])(/.*)?$", s)     # MSYS `/c/...` and WSL `/mnt/c/...`
         if m:
             s = m.group(1).upper() + ":" + (m.group(2) or "/")
         elif s == "/tmp" or s.startswith("/tmp/"):
@@ -744,6 +750,15 @@ def _cmd_python(seg, ctx, excerpt, raw_text):
 def _analyze_text(text, ctx: Ctx, depth=0):
     if depth > 4:
         raise Deny("unresolved", "too many nested shells")
+    if ctx.dialect == "ps":
+        for m in RX_NET_DELETE.finditer(text):
+            ctx.destructive = True
+            arg = m.group(1)
+            lit = re.fullmatch(r"'([^']*)'|\"([^\"$`]*)\"", arg)
+            if not lit:
+                raise Deny("unresolved", "[IO.Directory]::Delete with a computed path: %s" % arg[:80])
+            ctx.recursive = True
+            _target(lit.group(1) if lit.group(1) is not None else lit.group(2), ctx, m.group(0)[:120])
     toks = _tokens(_strip_heredoc(text) if ctx.dialect == "bash" else text, ctx.dialect)
     previous, prev_sep = None, ""
     for seg, sep in _segments(toks):
@@ -852,10 +867,20 @@ def _segment(seg, ctx, raw_text, previous, depth):
             ctx.cwd = None
         return
     # nested shells
-    if cw in ("bash", "sh", "zsh") and "-c" in args:
-        k = args.index("-c")
-        if k + 1 < len(args):
+    if cw in SHELLS:
+        k = next((j for j, a in enumerate(args) if RX_SHELL_C.match(a)), None)
+        if k is not None and k + 1 < len(args):
             _sub(args[k + 1], "bash", ctx, depth)
+        return
+    if cw == "wsl":                                  # `wsl rm -rf ...`, `wsl -d X -- rm ...`, `wsl -e bash -c ...`
+        j = 0
+        while j < len(args) and args[j].startswith("-"):
+            if args[j] in ("--", "-e", "--exec"):
+                j += 1
+                break
+            j += 2 if args[j].lower() in ("-d", "--distribution", "-u", "--user", "--cd", "--shell-type") else 1
+        if j < len(args):
+            _sub(" ".join(args[j:]), "bash", ctx, depth)
         return
     if cw in ("powershell", "pwsh"):
         al = [a.lower() for a in args]

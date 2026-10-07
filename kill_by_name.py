@@ -6,8 +6,11 @@ python on the machine: other agents' long runs, MCP servers, dev servers, backgr
 sessions. A sandbox that isolates files does not isolate processes, and "work only inside this folder"
 does not reach a command that kills by image name.
 
-Denies: `taskkill` with `/IM`; `Stop-Process -Name`; `Get-Process <name> | Stop-Process`; `pkill`;
-`killall`; `kill $(pgrep|pidof ...)`; `wmic process where name=... delete|call terminate`.
+Denies: `taskkill` with `/IM`; `Stop-Process -Name` (any prefix: `-n`, `-ProcessName`, alias `spps`);
+`Get-Process` without `-Id` piped into `Stop-Process` or `.Kill()` (also through `Where-Object` filters);
+`pkill`; `killall` (also inside quotes: `bash -lc "pkill -f x"`); `kill $(pgrep|pidof ...)`;
+`wmic process where name=... delete|call terminate`; `Win32_Process` filtered by name and terminated (CIM/WMI);
+`kill -Name x` (the PowerShell alias). From the PowerShell tool only, `kill -n x` too: in bash `-n` is a signal.
 Allows: `taskkill /PID <n> /T /F`, `kill <pid>`, `Stop-Process -Id <n>`.
 Any internal error lets the command through (a guard that breaks work by its own bug is worse than none).
 
@@ -23,24 +26,46 @@ for _f in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# PowerShell accepts any unambiguous prefix of a parameter: `-n`, `-na`, `-Name`, `-ProcessName`, `-pr`
+_PS_NAME = r"-(?:n(?:a(?:me?)?)?|pr(?:o(?:c(?:e(?:s(?:s(?:n(?:a(?:me?)?)?)?)?)?)?)?)?)(?=[\s:]|$)"
+# a command start: line start, separator, or a quote (`bash -lc "pkill ..."` from the PowerShell tool)
+_START = r"(?:^|[\s;&|(\"'])"
+
 PATTERNS = (
     ("taskkill /IM", re.compile(r"\btaskkill(?:\.exe)?\b[^\n;&|]*?\s[/-]{1,2}im\b", re.I)),
-    ("Stop-Process -Name", re.compile(r"\b(?:Stop-Process|spps)\b[^\n;|]*\s-(?:Process)?Name\b", re.I)),
+    ("Stop-Process -Name", re.compile(r"\b(?:Stop-Process|spps)\b[^\n;|]*\s" + _PS_NAME, re.I)),
     ("Get-Process <name> | Stop-Process", re.compile(
         r"\b(?:Get-Process|gps|ps)\s+(?!-Id\b)(?!-)[^\n|;]*\|\s*(?:Stop-Process|spps|kill)\b", re.I)),
-    ("pkill", re.compile(r"(?:^|[\s;&|(])pkill\b", re.I)),
-    ("killall", re.compile(r"(?:^|[\s;&|(])killall\b", re.I)),
+    ("pkill", re.compile(_START + r"pkill\b", re.I)),
+    ("killall", re.compile(_START + r"killall\b", re.I)),
     ("kill $(pgrep)", re.compile(r"\bkill\b[^\n;]*\$\(\s*(?:pgrep|pidof)\b", re.I)),
     ("wmic by name", re.compile(r"\bwmic\b[^\n]*\bprocess\b[^\n]*\bname\b[^\n]*\b(?:delete|terminate)\b", re.I)),
+    ("Win32_Process by name | Terminate", re.compile(
+        r"\bWin32_Process\b[^\n;]*\bname\b[^\n;]*\bTerminate\b", re.I)),
+    # `kill -Name x` is Stop-Process in PowerShell; bash `kill` has no `-Name` / `-ProcessName`
+    ("kill -Name (PowerShell alias)", re.compile(_START + r"kill\s[^\n;|]*?-(?:Process)?Name\b", re.I)),
 )
+# only from the PowerShell tool: there `kill` is Stop-Process and `-n` is -Name (in bash, `kill -n 9` is a signal)
+PS_ONLY = (
+    ("kill -n (PowerShell alias)", re.compile(_START + r"kill\s[^\n;|]*?" + _PS_NAME, re.I)),
+)
+# Get-Process without -Id whose objects reach Stop-Process or .Kill(), in the same statement:
+# `Get-Process -Name node | Stop-Process`, `Get-Process | ? Name -eq x | Stop-Process`, `(Get-Process x).Kill()`
+_GPS = re.compile(r"\b(?:Get-Process|gps)\b", re.I)
+_GPS_KILL = re.compile(r"\|\s*(?:Stop-Process|spps|kill)\b|\.Kill\s*\(", re.I)
+_BY_ID = re.compile(r"(?:^|\s)-Id\b|\.Id\s*-(?:eq|in)\b|\bId\s+-(?:eq|in)\b", re.I)
 
 
 def match(event: dict) -> str:
     """Name of the kill-by-name pattern found in the command, or ''."""
     cmd = str(((event or {}).get("tool_input") or {}).get("command") or "")
-    for name, rx in PATTERNS:
+    ps = str((event or {}).get("tool_name") or "").lower().startswith("power")
+    for name, rx in PATTERNS + (PS_ONLY if ps else ()):
         if rx.search(cmd):
             return name
+    for stmt in re.split(r"[;\n]", cmd):
+        if _GPS.search(stmt) and _GPS_KILL.search(stmt) and not _BY_ID.search(stmt):
+            return "Get-Process ... | Stop-Process / .Kill()"
     return ""
 
 

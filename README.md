@@ -8,6 +8,23 @@ Two Claude Code `PreToolUse` guards for Bash and PowerShell, built for Windows f
 - **kill by name**: denies `taskkill /IM`, `Stop-Process -Name`, `pkill`, `killall` and friends.
   Kill the PID of what you started, not every process with the same name.
 
+## Commands from the PowerShell tool
+
+Agents on Windows often reach bash, WSL or .NET from the PowerShell tool. The guards follow them:
+
+| command (PowerShell tool) | result |
+|---|---|
+| `bash -lc "rm -rf /c/other"`, `& "C:\Program Files\Git\bin\bash.exe" -lc '...'`, `sh -ec`, `bash --login -c` | judged as the inner bash command |
+| `wsl rm -rf /mnt/c/...`, `wsl -d Ubuntu -- rm -rf ...` | judged as bash; `/mnt/c/` is read as `C:/` |
+| `Remove-Item -Recurse` / `ri -r` / `gci ... \| ri -Recurse` outside the project tree | deny |
+| `[System.IO.Directory]::Delete("C:\other", $true)` | judged like `Remove-Item -Recurse`; a computed path is denied |
+| `Stop-Process -Name x`, `spps -n x`, `-ProcessName`, `kill -Name x`, `kill -n x` | deny |
+| `Get-Process -Name x \| Stop-Process`, `Get-Process \| ? Name -eq x \| Stop-Process`, `(Get-Process x).Kill()` | deny |
+| `Get-CimInstance Win32_Process -Filter "Name='x'" \| Invoke-CimMethod -MethodName Terminate` | deny |
+| `Stop-Process -Id 1234`, `Get-Process -Id 1234 \| Stop-Process`, `Get-Process x \| Select Id` | allow |
+
+`kill -n` is read as `-Name` only from the PowerShell tool: in bash, `kill -n 9 <pid>` sends a signal.
+
 ## Why
 
 Related issue: [anthropics/claude-code#97660](https://github.com/anthropics/claude-code/issues/97660).

@@ -177,6 +177,39 @@ class BlastRadiusTest(unittest.TestCase):
             self.assertIsNone(self.ev(c, "PowerShell"), c)
 
     # ── negative controls: break the guard, the suite must notice ──
+    # ── the PowerShell tool handing a delete to bash, wsl or .NET ──
+    def test_powershell_tool_nested_and_dotnet(self):
+        sb = self.sb
+        o, ow = n(sb.other), n(sb.other).replace("/", "\\")
+        msys = ("/" + o[0].lower() + o[2:]) if o[1:2] == ":" else o
+        for c in ['bash -lc "rm -rf %s"' % msys, "bash -lc 'rm -rf %s'" % o, 'bash.exe -lc "rm -rf %s/sub"' % o,
+                  '& "C:\\Program Files\\Git\\bin\\bash.exe" -lc "rm -rf %s"' % o,
+                  "& 'C:\\Program Files\\Git\\usr\\bin\\bash.exe' -l -c 'rm -rf %s'" % o,
+                  'bash --login -c "rm -rf %s"' % o, 'sh -ec "rm -rf %s"' % o,
+                  'bash -lc "cd /tmp && rm -rf %s"' % o, "wsl rm -rf %s" % msys, "wsl -d Ubuntu -- rm -rf %s" % msys,
+                  "Remove-Item -Recurse -Force %s" % ow, 'Remove-Item -LiteralPath "%s" -Recurse -Force' % ow,
+                  "ri -r -fo %s" % ow, "gci %s -Directory | ri -Recurse -Force" % ow,
+                  '[System.IO.Directory]::Delete("%s", $true)' % ow, "[IO.Directory]::Delete('%s', $true)" % ow]:
+            self.assertDenied("zone", c, "PowerShell")
+        self.assertDenied("empty", "bash -lc 'rm -rf \"$EMPTY_X/\"'", "PowerShell")
+        self.assertDenied("unresolved", "[System.IO.Directory]::Delete($dir, $true)", "PowerShell")
+        pw = n(sb.proj).replace("/", "\\")
+        for c in ['bash -lc "git status"', 'bash -lc "rm -rf %s/src/build"' % n(sb.proj),
+                  "Remove-Item -Recurse -Force %s\\src\\build" % pw, "Remove-Item %s\\src\\a.txt" % pw,
+                  '[System.IO.Directory]::Delete("%s\\src\\gone", $true)' % pw,
+                  '[System.IO.Directory]::Delete("%s\\src\\empty")' % pw]:
+            self.assertAllowed(c, "PowerShell")
+        p = n(sb.proj)
+        if WIN and p[1:2] == ":":                   # WSL sees C:\ as /mnt/c
+            self.assertAllowed("wsl rm -rf /mnt/%s%s/src/build" % (p[0].lower(), p[2:]), "PowerShell")
+
+    def test_negative_control_nested_bash_flag(self):
+        # with only the literal `-c` recognized (the 0.1.0 behavior), `bash -lc` must slip through again
+        import re as _re
+        with mock.patch.object(br, "RX_SHELL_C", _re.compile(r"^-c$")):
+            r = self.ev('bash -lc "rm -rf %s"' % n(self.sb.other), "PowerShell")
+        self.assertFalse(r and r["deny"], "with the bundled-flag parsing removed the case must pass")
+
     def test_negative_control_empty_variable_check(self):
         with mock.patch.object(br, "_empty_var", lambda name: [""]):
             r = self.ev('rm -rf "${EMPTY_X}x"', cwd=self.sb.tmp)
@@ -197,7 +230,9 @@ class KillByNameTest(unittest.TestCase):
         for c in ['cd "C:/x"; taskkill //F //IM python.exe >/dev/null 2>&1; cat a.txt', "taskkill /f /im node.exe",
                   "taskkill.exe -IM python.exe -F", "Stop-Process -Name python -Force",
                   "Get-Process python | Stop-Process", "pkill -f server.py", "sleep 1; killall python3",
-                  "kill -9 $(pgrep -f server)", "wmic process where name='python.exe' delete"]:
+                  "kill -9 $(pgrep -f server)", "wmic process where name='python.exe' delete",
+                  'powershell -NoProfile -Command "kill -Name python"',
+                  'powershell -NoProfile -Command "Get-Process -Name Claude | Stop-Process -Force"']:
             self.assertTrue(kbn.match(self.ev(c)), c)
             self.assertEqual(kbn.decide(self.ev(c))["hookSpecificOutput"]["permissionDecision"], "deny")
 
@@ -206,6 +241,44 @@ class KillByNameTest(unittest.TestCase):
                   "Get-Process -Id 4312 | Stop-Process", "python -c \"import os; os.kill(4312, 9)\""]:
             self.assertFalse(kbn.match(self.ev(c)), c)
             self.assertIsNone(kbn.decide(self.ev(c)))
+
+    # ── commands that arrive through the PowerShell tool ──
+    PS_DENIED = ["spps -n python", "Stop-Process -ProcessName node -Force", "Stop-Process -Na python",
+                 "Get-Process -Name node | Stop-Process -Force", "gps node | spps",
+                 'Get-Process | Where-Object { $_.Name -eq "python" } | Stop-Process -Force',
+                 'Get-Process | ? ProcessName -like "py*" | Stop-Process', "(Get-Process python).Kill()",
+                 "Get-Process -Name python | ForEach-Object { $_.Kill() }", "kill -Name python", "kill -n python",
+                 "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Invoke-CimMethod -MethodName Terminate",
+                 "Get-WmiObject Win32_Process -Filter \"name='node.exe'\" | ForEach-Object { $_.Terminate() }",
+                 'bash -lc "pkill -f python"', "taskkill /F /IM python.exe"]
+    PS_ALLOWED = ["Stop-Process -Id 1234", "kill -Id 1234", "kill 1234", "Get-Process python",
+                  "Get-Process -Name python | Select-Object Id, StartTime", "Get-Process -Id 1234 | Stop-Process",
+                  "Get-Process | Where-Object { $_.Id -eq 1234 } | Stop-Process",
+                  "$p = Start-Process python -PassThru; Stop-Process -Id $p.Id",
+                  "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Select ProcessId, CommandLine",
+                  "Stop-Process -Id 1234 -PassThru", 'bash -lc "git status"']
+
+    def test_powershell_tool_denied(self):
+        for c in self.PS_DENIED:
+            e = {"tool_name": "PowerShell", "tool_input": {"command": c}}
+            self.assertTrue(kbn.match(e), c)
+
+    def test_powershell_tool_allowed(self):
+        for c in self.PS_ALLOWED:
+            e = {"tool_name": "PowerShell", "tool_input": {"command": c}}
+            self.assertFalse(kbn.match(e), "%s -> %s" % (c, kbn.match(e)))
+
+    def test_bash_kill_n_is_a_signal_not_a_name(self):
+        # in bash, `kill -n 9 <pid>` sends signal 9; only the PowerShell tool reads `kill -n` as -Name
+        self.assertFalse(kbn.match(self.ev("kill -n 9 4312")))
+        self.assertTrue(kbn.match({"tool_name": "PowerShell", "tool_input": {"command": "kill -n node"}}))
+
+    def test_negative_control_pipeline_rule(self):
+        # without the Get-Process ... | Stop-Process rule, the filtered pipeline must slip through
+        e = {"tool_name": "PowerShell", "tool_input": {"command": "Get-Process -Name node | Stop-Process -Force"}}
+        with mock.patch.object(kbn, "_GPS_KILL", mock.Mock(search=lambda s: None)):
+            self.assertFalse(kbn.match(e))
+        self.assertTrue(kbn.match(e))
 
 
 class RealHookTest(unittest.TestCase):
@@ -235,6 +308,25 @@ class RealHookTest(unittest.TestCase):
         r = self.run_hook("guard.py", json.dumps(e))
         self.assertEqual(r.returncode, 0)
         self.assertEqual(json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_guard_powershell_tool_real_path(self):
+        sb = Sandbox()
+        try:
+            env = dict(os.environ)
+            env.update(sb.env)
+            # the sandbox lives in the real temp folder (an allowed zone for the child's full environment),
+            # so the real-path case targets the fake HOME, which is denied everywhere
+            for c in ('bash -lc "rm -rf %s"' % n(sb.home), "Get-Process -Name node | Stop-Process -Force",
+                      "Remove-Item -Recurse -Force %s" % n(sb.home).replace("/", "\\")):
+                e = {"tool_name": "PowerShell", "tool_input": {"command": c}, "cwd": n(sb.proj)}
+                r = self.run_hook("guard.py", json.dumps(e), env)
+                self.assertEqual(r.returncode, 0, c)
+                self.assertEqual(json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"], "deny", c)
+            e = {"tool_name": "PowerShell", "tool_input": {"command": "Stop-Process -Id 4312"}, "cwd": n(sb.proj)}
+            r = self.run_hook("guard.py", json.dumps(e), env)
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, ""))
+        finally:
+            sb.close()
 
     def test_guard_silent_on_harmless_and_on_bad_input(self):
         r = self.run_hook("guard.py", json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}}))
